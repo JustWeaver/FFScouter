@@ -126,6 +126,7 @@ if (!singleton) {
     "https://raw.githubusercontent.com/rDacted2/fair_fight_scouter/main/images/green-arrow.svg";
   var RED_ARROW =
     "https://raw.githubusercontent.com/rDacted2/fair_fight_scouter/main/images/red-arrow.svg";
+  const darkMode = body.classList.contains('dark-mode')
 
   var rD_xmlhttpRequest;
   var rD_setValue;
@@ -214,6 +215,14 @@ if (!singleton) {
       // Reload page
       window.location.reload();
     }
+  });
+
+  var showStats = rD_getValue("show_stats", false);
+
+  rD_registerMenuCommand(showStats ? "Show FF Score" : "Show Stats", () => {
+    rD_setValue('show_stats', !showStats);
+    // Reload page
+    window.location.reload();
   });
 
   function create_text_location() {
@@ -504,13 +513,23 @@ if (!singleton) {
 
     let statDetails = "";
     if (ff_response.bs_estimate_human) {
-      statDetails = `<span style=\"font-size: 11px; font-weight: normal; margin-left: 8px; vertical-align: middle; color: #cccccc; font-style: italic;\">Est. Stats: <span>${ff_response.bs_estimate_human}</span></span>`;
-    }
+      if (darkMode) {
+          statDetails = `<span style=\"font-size: 11px; font-weight: normal; margin-left: 8px; vertical-align: middle; color: #cccccc; font-style: italic;\">Est. Stats: <span>${ff_response.bs_estimate_human}</span></span>`;
+      } else {
+          statDetails = `<span style=\"font-size: 11px; font-weight: normal; margin-left: 8px; vertical-align: middle; color: #555555; font-style: italic;\">Est. Stats: <span>${ff_response.bs_estimate_human}</span></span>`;
+      }
 
     return `<span style=\"font-weight: bold; margin-right: 6px;\">FairFight:</span><span style=\"background: ${background_colour}; color: ${text_colour}; font-weight: bold; padding: 2px 6px; border-radius: 4px; display: inline-block;\">${ff_string} (${difficulty}) ${fresh}</span>${statDetails}`;
   }
 
   function get_ff_string_short(ff_response, player_id) {
+    if (ff_response?.no_data) {
+      return "?";
+    }
+    else if (showStats) {
+      return ff_response.bs_estimate_human
+    }
+    
     const ff = ff_response.value.toFixed(2);
 
     const now = Date.now() / 1000;
@@ -857,7 +876,7 @@ if (!singleton) {
         $(mini).find(".ff-scouter-mini-ff").remove();
 
         // Minimal, text-only Fair Fight string for mini-profiles
-        const ff_string = get_ff_string(response);
+        const ff_string = showStats ? response.bs_estimate_human : `FF ${get_ff_string(response)}`;
         const difficulty = get_difficulty_text(response.value);
         const now = Date.now() / 1000;
         const age = now - response.last_updated;
