@@ -16,7 +16,7 @@
 // @license      GPL-3.0
 // ==/UserScript==
 
-const FF_VERSION = "2.64";
+const FF_VERSION = "2.65";
 const API_INTERVAL = 30000;
 const FF_TARGET_STALENESS = 24 * 60 * 60 * 1000; // Refresh the target list every day
 const TARGET_KEY = "ffscouterv2-targets";
