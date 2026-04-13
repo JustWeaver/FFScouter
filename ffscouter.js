@@ -711,18 +711,11 @@ if (!singleton) {
   }
 
   function inject_info_line(h4, info_line) {
-    if (h4.textContent === "Attacking") {
-      h4.parentNode.parentNode.after(info_line);
+    const linksTopWrap = h4.parentNode.querySelector(".links-top-wrap");
+    if (linksTopWrap) {
+      linksTopWrap.parentNode.insertBefore(info_line, linksTopWrap.nextSibling);
     } else {
-      const linksTopWrap = h4.parentNode.querySelector(".links-top-wrap");
-      if (linksTopWrap) {
-        linksTopWrap.parentNode.insertBefore(
-          info_line,
-          linksTopWrap.nextSibling,
-        );
-      } else {
-        h4.after(info_line);
-      }
+      h4.after(info_line);
     }
   }
 
@@ -1581,7 +1574,7 @@ if (!singleton) {
     /https:\/\/www.torn.com\/profiles.php\?XID=(?<target_id>\d+)/,
   );
   const match2 = window.location.href.match(
-    /https:\/\/www.torn.com\/loader.php\?sid=attack&user2ID=(?<target_id>\d+)/,
+    /https:\/\/www.torn.com\/page.php\?sid=attack&user2ID=(?<target_id>\d+)/,
   );
   const match = match1 ?? match2;
   if (match) {
@@ -1954,7 +1947,7 @@ if (!singleton) {
         await apply_ff_gauge(Array.from(node.querySelectorAll(".listed")));
       } else if (
         window.location.href.startsWith(
-          "https://www.torn.com/loader.php?sid=attackLog",
+          "https://www.torn.com/page.php?sid=attackLog",
         )
       ) {
         const participants = Array.from(
@@ -2205,7 +2198,7 @@ if (!singleton) {
       if (linkType === "profile") {
         profileLink = `https://www.torn.com/profiles.php?XID=${rando.player_id}`;
       } else {
-        profileLink = `https://www.torn.com/loader.php?sid=attack&user2ID=${rando.player_id}`;
+        profileLink = `https://www.torn.com/page.php?sid=attack&user2ID=${rando.player_id}`;
       }
 
       if (tabType === "sametab") {
