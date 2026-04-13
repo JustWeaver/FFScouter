@@ -2,7 +2,7 @@
 // @name         FF Scouter V2
 // @namespace    Violentmonkey Scripts
 // @match        https://www.torn.com/*
-// @version      2.73.1
+// @version      2.73
 // @author       rDacted, Weav3r, xentac, Glasnost
 // @description  Shows the expected Fair Fight score against targets and faction war status
 // @grant        GM_xmlhttpRequest
@@ -1468,9 +1468,10 @@ if (!singleton) {
   
   function inject_faction_sort_panel() {
     if (document.getElementById("ff-scouter-faction-settings")) return;
-
-    const membersList = document.querySelector(".members-list");
+	
+	const membersList = document.querySelector(".members-list");
     if (!membersList) return;
+    if (membersList.closest(".enemy-faction") || membersList.closest(".your-faction")) return;
 
     const savedSort = rD_getValue(FACTION_SORT_KEY, "none");
 
@@ -1678,7 +1679,7 @@ if (!singleton) {
     const torn_observer = new MutationObserver(async function () {
       // Find the member table - add a column if it doesn't already have one, for FF scores
       var members_list = $(".members-list")[0];
-      if (members_list) {
+      if (members_list && !members_list.closest(".enemy-faction") && !members_list.closest(".your-faction")) {
         torn_observer.disconnect();
 
         var player_ids = get_members();
