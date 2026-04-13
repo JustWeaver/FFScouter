@@ -2,7 +2,7 @@
 // @name         FF Scouter V2
 // @namespace    Violentmonkey Scripts
 // @match        https://www.torn.com/*
-// @version      2.72.1
+// @version      2.73.1
 // @author       rDacted, Weav3r, xentac, Glasnost
 // @description  Shows the expected Fair Fight score against targets and faction war status
 // @grant        GM_xmlhttpRequest
@@ -23,11 +23,15 @@ const TARGET_KEY = "ffscouterv2-targets";
 const TARGET_INDEX_KEY = "ffscouterv2-target-index";
 const CLEARED_TSC_KEY = "ffscouterv2-cleared-tsc-keys";
 const CHECK_KEY_CACHE_KEY = "ffscouterv2-check-key-cache";
-const CHECK_KEY_INTERVAL = 15 * 60 * 1000;
+const CHECK_KEY_INTERVAL = 5 * 60 * 1000;
 const memberCountdowns = {};
 const MAX_REQUESTS_PER_MINUTE = 20;
+const FACTION_SORT_KEY = "ffscouterv2-faction-sort";
+const FLIGHT_CACHE_DURATION = 3 * 60 * 1000; // 3 minutes, in ms
+const flightCache = {}; // keyed by target_id: { data, statusDescription, expiry }
 let apiCallInProgressCount = 0;
 let currentUserId = null;
+let cachedIsPremium = null; // module-level premium flag, populated by checkKeyAndUpdatePremium
 
 const TOAST_ERROR = "error";
 const TOAST_LOG = "log";
@@ -1461,6 +1465,103 @@ if (!singleton) {
       value.nextSibling.after(fair_fight_div, estimate_div);
     });
   }
+  
+  function inject_faction_sort_panel() {
+    if (document.getElementById("ff-scouter-faction-settings")) return;
+
+    const membersList = document.querySelector(".members-list");
+    if (!membersList) return;
+
+    const savedSort = rD_getValue(FACTION_SORT_KEY, "none");
+
+    const panel = document.createElement("details");
+    panel.id = "ff-scouter-faction-settings";
+    panel.style.cssText = "margin-bottom:8px; padding:8px 10px; background-color:var(--ff-bg-color); border:1px solid var(--ff-border-color); border-radius:5px;";
+
+    const summary = document.createElement("summary");
+    summary.textContent = "FFScouter Settings";
+    summary.style.cursor = "pointer";
+    panel.appendChild(summary);
+
+    const body = document.createElement("div");
+    body.style.cssText = "margin-top:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;";
+
+    const label = document.createElement("label");
+    label.textContent = "Sort By Difficulty:";
+    label.style.cssText = "color:var(--ff-text-color); font-size:13px;";
+    body.appendChild(label);
+
+    const select = document.createElement("select");
+    select.id = "ff-scouter-sort-select";
+    select.className = "ff-settings-input";
+    select.style.width = "160px";
+
+    [
+      { value: "none",  text: "No Sorting"     },
+      { value: "asc",   text: "Easiest First"  },
+      { value: "desc",  text: "Hardest First"  },
+    ].forEach(({ value, text }) => {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      select.appendChild(opt);
+    });
+    select.value = savedSort;
+    body.appendChild(select);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Set as Default";
+    saveBtn.className = "ff-settings-button torn-btn";
+    saveBtn.addEventListener("click", function () {
+      const chosen = select.value;
+      rD_setValue(FACTION_SORT_KEY, chosen);
+      apply_faction_sort(chosen);
+      showToast("Faction sort preference saved!", TOAST_LOG);
+    });
+    body.appendChild(saveBtn);
+
+    panel.appendChild(body);
+    membersList.parentNode.insertBefore(panel, membersList);
+
+    // Apply current saved sort immediately
+    apply_faction_sort(savedSort);
+  }
+
+  function apply_faction_sort(order) {
+    const tableBody = document.querySelector(".members-list .table-body");
+    if (!tableBody) return;
+
+    const rows = Array.from(tableBody.querySelectorAll(".table-row"));
+    if (rows.length === 0) return;
+
+    if (order === "none") {
+      // Restore original order using the tt-member-index if present, else do nothing
+      rows.sort((a, b) => {
+        const ai = parseInt(a.querySelector(".tt-member-index")?.textContent) || 0;
+        const bi = parseInt(b.querySelector(".tt-member-index")?.textContent) || 0;
+        return ai - bi;
+      });
+    } else {
+      rows.sort((a, b) => {
+        const getFF = (row) => {
+          const cell = row.querySelector(".ff-scouter-ff-visible, .ff-scouter-ff-hidden");
+          if (!cell) return null;
+          const val = parseFloat(cell.textContent.replace("?", ""));
+          return isNaN(val) ? null : val;
+        };
+        const aFF = getFF(a);
+        const bFF = getFF(b);
+        // Rows with no data sort to the end
+        if (aFF === null && bFF === null) return 0;
+        if (aFF === null) return 1;
+        if (bFF === null) return -1;
+        return order === "asc" ? aFF - bFF : bFF - aFF;
+      });
+    }
+
+    rows.forEach(row => tableBody.appendChild(row));
+  }
+  
 
   async function get_cache_misses(player_ids) {
     var unknown_player_ids = [];
@@ -1487,6 +1588,69 @@ if (!singleton) {
     update_ff_cache([target_id], function (target_ids) {
       display_fair_fight(target_ids[0], target_id);
     });
+	
+    // Flight info: watch for .profile-status with 'travelling' class.
+    // Torn may insert the element first, then add the class in a second pass,
+    // so we observe both childList insertions and attribute mutations.
+    (function () {
+      let flightObserver = null;
+      let attrObserver = null;
+
+	function tryFlight() {
+	  const ps = document.querySelector(".profile-status");
+	  //console.log("[FF Flight] tryFlight: ps=", !!ps, "travelling=", ps?.classList.contains("travelling"));
+	  if (ps && ps.classList.contains("travelling")) {
+		if (flightObserver) { flightObserver.disconnect(); flightObserver = null; }
+		if (attrObserver) { attrObserver.disconnect(); attrObserver = null; }
+		//console.log("[FF Flight] calling fetchAndDisplayFlightInfo");
+		fetchAndDisplayFlightInfo(target_id);
+		return true;
+	  }
+	  if (ps && !attrObserver) {
+		//console.log("[FF Flight] profile-status found but no travelling, setting up attrObserver");
+		attrObserver = new MutationObserver(function () { tryFlight(); });
+		attrObserver.observe(ps, { attributes: true, attributeFilter: ["class"] });
+	  }
+	  return false;
+	}
+
+      // Try immediately in case it's already in DOM with 'travelling'
+      if (!tryFlight()) {
+        // Watch for profile-status being added to the DOM
+        flightObserver = new MutationObserver(function () { tryFlight(); });
+        flightObserver.observe(document.body, { childList: true, subtree: true });
+        // Safety timeout — stop watching after 15 seconds
+        setTimeout(function () {
+          if (flightObserver) { flightObserver.disconnect(); flightObserver = null; }
+          if (attrObserver) { attrObserver.disconnect(); attrObserver = null; }
+        }, 15000);
+      }
+	  
+	  const statusWatcher = new MutationObserver(function () {
+        const currentPS = document.querySelector(".profile-status");
+        if (!currentPS || !currentPS.classList.contains("travelling")) {
+          const block = document.getElementById("ff-scouter-flight-info");
+          if (block) block.remove();
+          if (window._ffFlightCountdownInterval) {
+            clearInterval(window._ffFlightCountdownInterval);
+            window._ffFlightCountdownInterval = null;
+          }
+        }
+      });
+      const psForWatcher = document.querySelector(".profile-status");
+      if (psForWatcher) {
+        statusWatcher.observe(psForWatcher, { attributes: true, attributeFilter: ["class"] });
+      } else {
+        const attachWatcher = new MutationObserver(function () {
+          const ps = document.querySelector(".profile-status");
+          if (ps) {
+            attachWatcher.disconnect();
+            statusWatcher.observe(ps, { attributes: true, attributeFilter: ["class"] });
+          }
+        });
+        attachWatcher.observe(document.body, { childList: true, subtree: true });
+      }
+    })();
 
     // Inject Stats History button into Actions area
     // Use a MutationObserver in case the Actions area loads after page JS runs
@@ -1518,7 +1682,11 @@ if (!singleton) {
         torn_observer.disconnect();
 
         var player_ids = get_members();
-        await update_ff_cache(player_ids, apply_fair_fight_info);
+        inject_faction_sort_panel();
+        await update_ff_cache(player_ids, async function (ids) {
+          await apply_fair_fight_info(ids);
+          apply_faction_sort(rD_getValue(FACTION_SORT_KEY, "none"));
+        });
       }
     });
 
@@ -2067,6 +2235,255 @@ if (!singleton) {
     let seconds = String(totalSeconds % 60).padStart(2, "0");
     return `${hours}:${minutes}:${seconds}`;
   }
+  
+  function formatCountdownDuration(ms) {
+    if (ms <= 0) return "0s";
+    const totalSeconds = Math.floor(ms / 1000);
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = totalSeconds % 60;
+    let parts = [];
+    if (h > 0) parts.push(`${h}h`);
+    if (m > 0 || h > 0) parts.push(`${m}m`);
+    parts.push(`${s}s`);
+    return parts.join(" ");
+  }
+  
+  function formatTakeoffUTC(ts, travelMethod) {
+    const d = new Date(ts * 1000);
+    const hh = String(d.getUTCHours()).padStart(2, "0");
+    const mm = String(d.getUTCMinutes()).padStart(2, "0");
+    const methodStr = travelMethod ? ` (${travelMethod})` : "";
+    return `${hh}:${mm} TCT${methodStr}`;
+  }
+  
+  function fetchAndDisplayFlightInfo(target_id) {
+	//console.log("[FF Flight] fetchAndDisplayFlightInfo called, key=", !!key, "cachedIsPremium=", cachedIsPremium);
+    // Only run on profile pages
+    if (!window.location.href.match(/https:\/\/www\.torn\.com\/profiles\.php\?XID=\d+/)) return;
+	if (ffSettingsGet("flight-tracker-enabled") === "false") return;
+
+    const profileStatus = document.querySelector(".profile-status");
+    if (!profileStatus || !profileStatus.classList.contains("travelling")) return;
+
+    // Clean up any previous flight info block
+    const existingBlock = document.getElementById("ff-scouter-flight-info");
+    if (existingBlock) existingBlock.remove();
+
+    const descWrap = profileStatus.querySelector(".desc-wrap");
+    if (!descWrap) return;
+
+    const block = document.createElement("div");
+    block.id = "ff-scouter-flight-info";
+    block.style.cssText = "margin-top:4px; font-size:12px; line-height:1.5;";
+
+    // Non-premium message
+    if (cachedIsPremium === false) {
+	  //console.log("[FF Flight] BAIL: not premium, showing upgrade message");
+      const msg = document.createElement("em");
+      msg.style.fontSize = "11px";
+      msg.textContent = "Upgrade to Premium to view travel time estimates";
+      block.appendChild(msg);
+      descWrap.appendChild(block);
+      return;
+    }
+
+
+    // Premium is null (not yet known) or true — attempt the API call
+    if (!key) return;
+
+    // Get the current page's status description to validate cache against
+    const pageStatusDesc = profileStatus.querySelector(".main-desc")?.textContent?.trim() ?? null;
+
+    // Check flight cache
+    const cached = flightCache[target_id];
+    if (cached && cached.expiry > Date.now() && cached.statusDescription === pageStatusDesc) {
+      // Use cached data
+      renderFlightData(existingBlock || block, cached.data, descWrap, existingBlock);
+      return;
+    }
+
+    block.textContent = "Loading flight info…";
+    if (!existingBlock) descWrap.appendChild(block);
+
+    const url = `${BASE_URL}/api/v1/player-flights?key=${key}&target=${target_id}`;
+    rD_xmlhttpRequest({
+      method: "GET",
+      url: url,
+      onload: function (response) {
+        if (!response) return;
+
+        const existingBlock2 = document.getElementById("ff-scouter-flight-info");
+        if (!existingBlock2) return;
+
+        if (response.status === 403) {
+          cachedIsPremium = false;
+          try {
+            const cached = JSON.parse(rD_getValue(CHECK_KEY_CACHE_KEY, null));
+            if (cached) {
+              rD_setValue(CHECK_KEY_CACHE_KEY, JSON.stringify({ ...cached, is_premium: false }));
+            }
+          } catch (_) {}
+          existingBlock2.innerHTML = "";
+          const msg = document.createElement("em");
+          msg.style.fontSize = "11px";
+          msg.textContent = "Upgrade to Premium to view travel time estimates";
+          existingBlock2.appendChild(msg);
+          return;
+        }
+
+        if (response.status === 429) {
+          try {
+            const err = JSON.parse(response.responseText);
+            const retryAfter = err.retry_after_seconds ? ` Try again in ${err.retry_after_seconds}s.` : "";
+            existingBlock2.innerHTML = "";
+            const msg = document.createElement("em");
+            msg.style.fontSize = "11px";
+            msg.textContent = `Flight tracker rate limited.${retryAfter}`;
+            existingBlock2.appendChild(msg);
+          } catch (_) {
+            existingBlock2.textContent = "";
+          }
+          return;
+        }
+
+        if (response.status !== 200) {
+          existingBlock2.textContent = "";
+          try {
+            const err = JSON.parse(response.responseText);
+            if (err && err.error) {
+              ffdebug("[FF Scouter V2] player-flights error:", err.error);
+            }
+          } catch (_) {}
+          return;
+        }
+
+        let data;
+        try {
+          data = JSON.parse(response.responseText);
+        } catch (e) {
+          ffdebug("[FF Scouter V2] player-flights parse error", e);
+          existingBlock2.textContent = "";
+          return;
+        }
+
+        const flight = data && data.current;
+        if (!flight) {
+          existingBlock2.textContent = "";
+          return;
+        }
+
+        // Validate status_description against the page
+        const apiDesc = flight.status_description?.trim() ?? null;
+        if (apiDesc && pageStatusDesc && apiDesc !== pageStatusDesc) {
+          // Mismatch — do not cache, re-fetch immediately
+          ffdebug("[FF Scouter V2] Flight status_description mismatch, re-fetching. API:", apiDesc, "Page:", pageStatusDesc);
+          existingBlock2.textContent = "";
+          fetchAndDisplayFlightInfo(target_id);
+          return;
+        }
+
+        // Cache the result
+        flightCache[target_id] = {
+          data: data,
+          statusDescription: pageStatusDesc,
+          expiry: Date.now() + FLIGHT_CACHE_DURATION,
+        };
+
+        renderFlightData(existingBlock2, data, null, true);
+      },
+      onerror: function (e) {
+        ffdebug("[FF Scouter V2] player-flights request error", e);
+        const b = document.getElementById("ff-scouter-flight-info");
+        if (b) b.textContent = "";
+      },
+      onabort: function (e) {
+        ffdebug("[FF Scouter V2] player-flights request aborted", e);
+      },
+      ontimeout: function (e) {
+        ffdebug("[FF Scouter V2] player-flights request timeout", e);
+      },
+    });
+  }
+  
+  function renderFlightData(block, data, descWrap, alreadyInDOM) {
+    const flight = data && data.current;
+    if (!flight) {
+      block.textContent = "";
+      return;
+    }
+
+    block.innerHTML = "";
+    block.style.cssText = "margin-top:4px; font-size:12px; line-height:1.6;";
+
+    if (!alreadyInDOM && descWrap) {
+      descWrap.appendChild(block);
+    }
+
+    if (flight.takeoff_time) {
+      const takeoffLine = document.createElement("div");
+      takeoffLine.textContent = `Takeoff: ${formatTakeoffUTC(flight.takeoff_time, flight.travel_method)}`;
+      block.appendChild(takeoffLine);
+    }
+
+    const earliest = flight.earliest_arrival_time ? flight.earliest_arrival_time * 1000 : null;
+    const latest = flight.latest_arrival_time ? flight.latest_arrival_time * 1000 : null;
+
+    if (!earliest && !latest) return;
+
+    const etaLine = document.createElement("div");
+    etaLine.id = "ff-scouter-eta-line";
+    block.appendChild(etaLine);
+
+    const fmtUTC = (ms) => {
+      const d = new Date(ms);
+      return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")} TCT`;
+    };
+
+    const utcLine = document.createElement("div");
+    if (earliest && latest) {
+      utcLine.textContent = `(${fmtUTC(earliest)} – ${fmtUTC(latest)})`;
+    } else if (earliest) {
+      utcLine.textContent = `(earliest ${fmtUTC(earliest)})`;
+    } else if (latest) {
+      utcLine.textContent = `(latest ${fmtUTC(latest)})`;
+    }
+    block.appendChild(utcLine);
+
+    if (window._ffFlightCountdownInterval) {
+      clearInterval(window._ffFlightCountdownInterval);
+      window._ffFlightCountdownInterval = null;
+    }
+
+    function updateEtaLine() {
+      const line = document.getElementById("ff-scouter-eta-line");
+      if (!line) {
+        clearInterval(window._ffFlightCountdownInterval);
+        window._ffFlightCountdownInterval = null;
+        return;
+      }
+      const now = Date.now();
+      if (earliest && now < earliest) {
+        const earlyMs = earliest - now;
+        const lateMs = latest ? (latest - now) : null;
+        line.textContent = lateMs !== null
+          ? `ETA: ${formatCountdownDuration(earlyMs)} – ${formatCountdownDuration(lateMs)}`
+          : `ETA: ${formatCountdownDuration(earlyMs)}`;
+      } else if (latest) {
+        const lateMs = latest - now;
+        if (lateMs > 0) {
+          line.textContent = `Latest Arrival Time: ${formatCountdownDuration(lateMs)}`;
+        } else {
+          line.textContent = "Expected to have landed";
+          clearInterval(window._ffFlightCountdownInterval);
+          window._ffFlightCountdownInterval = null;
+        }
+      }
+    }
+
+    updateEtaLine();
+    window._ffFlightCountdownInterval = setInterval(updateEtaLine, 1000);
+  }
 
   function fetchFactionData(factionID) {
     const url = `https://api.torn.com/v2/faction/${factionID}/members?striptags=true&key=${key}`;
@@ -2368,10 +2785,11 @@ if (!singleton) {
 
   async function createSettingsPanel() {
     // Check if we're on the user's own profile page
-    const pageId = window.location.href.match(/XID=(\d+)/)?.[1];
-    if (!pageId || pageId !== currentUserId) {
-      return;
-    }
+    //const pageId = window.location.href.match(/XID=(\d+)/)?.[1];
+    //if (!pageId || pageId !== currentUserId) {
+    //  return;
+    //}
+	// Disabled as people are having a hard time finding this
 
     // Wait for profile wrapper to be available
     const profileWrapper = await waitForElement(".profile-wrapper", 15000);
@@ -2425,10 +2843,14 @@ if (!singleton) {
     apiExplanation.innerHTML = `
       <strong>Important:</strong> You must use the SAME exact API key that you use on
       <a href="https://ffscouter.com/" target="_blank">ffscouter.com</a>.
-      <br><br>
       If you're not sure which API key you used, go to
       <a href="https://www.torn.com/preferences.php#tab=api" target="_blank">your API preferences</a>
       and look for "FFScouter3" in your API key history comments.
+      <br><br>
+      <strong>Want to upgrade to Premium?</strong> Send 1 Xanax to
+      <a href="https://www.torn.com/profiles.php?XID=1844049">Glasnost [1844049]</a>
+      per 15 days of premium. It should be credited within 5 minutes automatically.
+      You can send it in multiples too, such as 3 Xanax for 45 days.
     `;
     content.appendChild(apiExplanation);
 
@@ -2537,6 +2959,16 @@ if (!singleton) {
               showToast(ff_response.error);
               return;
             }
+
+            // Update premium cache and badge
+            const result = {
+              is_premium: !!ff_response.is_premium,
+              premium_expires_at: ff_response.premium_expires_at ?? null,
+              last_checked: Date.now(),
+            };
+            rD_setValue(CHECK_KEY_CACHE_KEY, JSON.stringify(result));
+            cachedIsPremium = result.is_premium;
+            applyPremiumBadge(result.is_premium, result.premium_expires_at);
 
             let message = `FF Scouter not configured. API key (${ff_response.key}) not registered.`;
             let level = TOAST_ERROR;
@@ -2763,6 +3195,23 @@ if (!singleton) {
     chainFFTargetDiv.appendChild(chainFFTargetInput);
 
     content.appendChild(chainFFTargetDiv);
+	
+	// Flight Tracker Toggle
+    const flightToggleDiv = document.createElement("div");
+    flightToggleDiv.className = "ff-settings-entry ff-settings-entry-small";
+    const flightToggle = document.createElement("input");
+    flightToggle.type = "checkbox";
+    flightToggle.id = "flight-tracker-toggle";
+    flightToggle.checked = ffSettingsGet("flight-tracker-enabled") !== "false";
+    flightToggle.className = "ff-settings-checkbox";
+    const flightLabel = document.createElement("label");
+    flightLabel.setAttribute("for", "flight-tracker-toggle");
+    flightLabel.textContent = "Enable flight tracker on profile pages";
+    flightLabel.className = "ff-settings-label";
+    flightLabel.style.cursor = "pointer";
+    flightToggleDiv.appendChild(flightToggle);
+    flightToggleDiv.appendChild(flightLabel);
+    content.appendChild(flightToggleDiv);
 
     // FF History Button Toggle
     const historyToggleDiv = document.createElement("div");
@@ -2848,6 +3297,7 @@ if (!singleton) {
       ffSettingsSetToggle("war-monitor-enabled", true);
       ffSettingsSetToggle("debug-logs", false);
       ffSettingsSet("ff-history-enabled", "true");
+	  ffSettingsSet("flight-tracker-enabled", "true");
       ffSettingsSet("factions-col-display", "fair_fight");
 
       document.getElementById("ff-ranges").value = "";
@@ -2858,6 +3308,7 @@ if (!singleton) {
       document.getElementById("war-monitor-toggle").checked = true;
       document.getElementById("debug-logs").checked = false;
       document.getElementById("ff-history-toggle").checked = true;
+	  document.getElementById("flight-tracker-toggle").checked = true;
       document.getElementById("factions-col-display").value = "fair_fight";
 
       document.getElementById("ff-ranges").style.outline = "none";
@@ -2900,8 +3351,8 @@ if (!singleton) {
       const chainFFTarget = document.getElementById("chain-ff-target").value;
       const warEnabled = document.getElementById("war-monitor-toggle").checked;
       const debugEnabled = document.getElementById("debug-logs").checked;
-      const historyEnabled =
-        document.getElementById("ff-history-toggle").checked;
+      const historyEnabled = document.getElementById("ff-history-toggle").checked;
+	  const flightTrackerEnabled = document.getElementById("flight-tracker-toggle").checked;
       const factionsColDisplay = document.getElementById(
         "factions-col-display",
       ).value;
@@ -2979,6 +3430,7 @@ if (!singleton) {
       ffSettingsSetToggle("war-monitor-enabled", warEnabled);
       ffSettingsSetToggle("debug-logs", debugEnabled);
       ffSettingsSet("ff-history-enabled", historyEnabled.toString());
+	  ffSettingsSet("flight-tracker-enabled", flightTrackerEnabled.toString());
       ffSettingsSet("factions-col-display", factionsColDisplay);
 
       const existingButtons = Array.from(
@@ -3104,7 +3556,7 @@ if (!singleton) {
         return null;
       }
     })();
-    if (_ckCached) applyPremiumBadge(_ckCached.is_premium);
+    if (_ckCached) applyPremiumBadge(_ckCached.is_premium, _ckCached.premium_expires_at);
     checkKeyAndUpdatePremium();
   }
 
@@ -3124,7 +3576,7 @@ if (!singleton) {
       now - cached.last_checked < CHECK_KEY_INTERVAL
     ) {
       ffdebug("[FF Scouter V2] check-key: using cached result");
-      applyPremiumBadge(cached.is_premium);
+      applyPremiumBadge(cached.is_premium, cached.premium_expires_at ?? null);
       return;
     }
     const url = `${BASE_URL}/api/v1/check-key?key=${key}`;
@@ -3136,11 +3588,12 @@ if (!singleton) {
         try {
           const data = JSON.parse(response.responseText);
           const result = {
-            is_premium: !!data.is_premium,
-            last_checked: Date.now(),
-          };
+              is_premium: !!data.is_premium,
+              premium_expires_at: data.premium_expires_at ?? null,
+              last_checked: Date.now(),
+            };
           rD_setValue(CHECK_KEY_CACHE_KEY, JSON.stringify(result));
-          applyPremiumBadge(result.is_premium);
+          applyPremiumBadge(result.is_premium, result.premium_expires_at);
         } catch (e) {
           ffdebug("[FF Scouter V2] check-key parse error", e);
         }
@@ -3151,9 +3604,12 @@ if (!singleton) {
     });
   }
 
-  function applyPremiumBadge(is_premium) {
+  function applyPremiumBadge(is_premium, premium_expires_at) {
     const existing = document.getElementById("ff-premium-badge");
     if (existing) existing.remove();
+    const existingExpiry = document.getElementById("ff-premium-expiry");
+    if (existingExpiry) existingExpiry.remove();
+
     const badge = document.createElement("span");
     badge.id = "ff-premium-badge";
     if (is_premium) {
@@ -3165,10 +3621,25 @@ if (!singleton) {
       badge.style.cssText =
         "display:inline-block;background:#C62828;color:#fff;font-size:11px;font-weight:bold;padding:2px 8px;border-radius:4px;vertical-align:middle;";
     }
+
     const premiumLabel = document.querySelector('label[for="ff-premium"]');
     if (premiumLabel) {
       premiumLabel.parentNode.insertBefore(badge, premiumLabel.nextSibling);
     }
+
+    if (is_premium && premium_expires_at) {
+      const daysLeft = Math.ceil((premium_expires_at * 1000 - Date.now()) / (86400 * 1000));
+      if (daysLeft > 0) {
+        const expiry = document.createElement("em");
+        expiry.id = "ff-premium-expiry";
+        expiry.style.cssText = "font-size:11px;margin-left:8px;vertical-align:middle;";
+        expiry.textContent = `Expires in ${daysLeft} day${daysLeft === 1 ? "" : "s"}`;
+        const badgeEl = document.getElementById("ff-premium-badge");
+        if (badgeEl) badgeEl.parentNode.insertBefore(expiry, badgeEl.nextSibling);
+      }
+    }
+
+    cachedIsPremium = is_premium;
   }
 
   function showToast(message, level) {
@@ -3250,14 +3721,10 @@ if (!singleton) {
       createSettingsPanel();
 
       const profileObserver = new MutationObserver(() => {
-        const pageId = window.location.href.match(/XID=(\d+)/)?.[1];
-        if (
-          pageId === currentUserId &&
-          window.location.pathname === "/profiles.php"
-        ) {
-          createSettingsPanel();
-        }
-      });
+          if (window.location.pathname === "/profiles.php") {
+            createSettingsPanel();
+          }
+        });
 
       profileObserver.observe(document.body, {
         childList: true,
