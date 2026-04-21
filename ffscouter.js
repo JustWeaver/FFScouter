@@ -2,7 +2,7 @@
 // @name         FF Scouter V2
 // @namespace    Violentmonkey Scripts
 // @match        https://www.torn.com/*
-// @version      2.73
+// @version      2.73.1
 // @author       rDacted, Weav3r, xentac, Glasnost
 // @description  Shows the expected Fair Fight score against targets and faction war status
 // @grant        GM_xmlhttpRequest
@@ -1480,6 +1480,16 @@ if (!singleton) {
     update_ff_cache([target_id], function (target_ids) {
       display_fair_fight(target_ids[0], target_id);
     });
+
+    if(match1){
+      if (!isPremiumKey()) {
+        console.log("[FF Scouter V2] Player is not premium, skipping flights fetch");
+        return;
+      }
+      console.log("[FF Scouter V2] Checking if player is traveling");
+      fetchAndRenderCurrentFlightWhenTraveling(target_id);
+
+    }
 
     // Inject Stats History button into Actions area
     // Use a MutationObserver in case the Actions area loads after page JS runs
@@ -3258,4 +3268,158 @@ if (!singleton) {
       });
     }
   });
+
+
+  /* PREMIUM - FLIGHT INFORMATION */
+
+  // Check if user is premium by checking the cache
+  function isPremiumKey() {
+    // If no key is saved, it is not premium
+    if (!key) {
+      return false;
+    }
+    try {
+      const cached = JSON.parse(rD_getValue(CHECK_KEY_CACHE_KEY, null));
+      if (
+        cached &&
+        typeof cached.is_premium !== "undefined" &&
+        cached.last_checked &&
+        Date.now() - cached.last_checked < CHECK_KEY_INTERVAL
+      ) {
+        return !!cached.is_premium;
+      }
+      // If outside the cache interval, consider that we don't know yet
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  function fetchPlayerCurrentFlight(target_id) {
+    return new Promise((resolve, reject) => {
+      const url = `${BASE_URL}/api/v1/player-flights?key=${key}&target=${target_id}`;
+      rD_xmlhttpRequest({
+        method: "GET",
+        url: url,
+        onload: function (response) {
+          if (response.status == 200) {
+            try {
+              const data = JSON.parse(response.responseText);
+              const result = {
+                earliest_arrival_time: data.current.earliest_arrival_time,
+                latest_arrival_time: data.current.latest_arrival_time,
+                takeoff_time: data.current.takeoff_time,
+                travel_method: data.current.travel_method
+              };
+              resolve(result);
+            } catch (err) {
+              reject(err);
+            }
+          } else {
+            console.log("[FF Scouter V2] Error fetching flights for player", target_id, response.status);
+            reject(new Error(`HTTP status ${response.status}`));
+          }
+        },
+        onerror: function (err) {
+          reject(err);
+        }
+      });
+    });
+  }
+
+  function updatePlayerCurrentFlight(data) {
+    const el = document.querySelector('.sub-desc');
+
+    //Get the time in the game format in HH:MM
+    function toGameHM(unix) {
+      if (!unix) return "N/A";
+      const date = new Date(unix * 1000);
+      return date.toISOString().slice(11, 16); // HH:MM
+    }
+
+    function durationStr(from, to) {
+      if (!from || !to) return "N/A";
+      let diff = to - from;
+      if (diff < 0) diff = 0;
+      const hrs = Math.floor(diff / 3600);
+      const mins = Math.floor((diff % 3600) / 60);
+      const secs = Math.floor(diff % 60);
+      return `${hrs}h${mins}m${secs}s`;
+    }
+
+    const nowUnix = Math.floor(Date.now() / 1000);
+    
+    const minDuration = durationStr(nowUnix, data.earliest_arrival_time);
+    const maxDuration = durationStr(nowUnix, data.latest_arrival_time);
+
+    const minArrivalHM = toGameHM(data.earliest_arrival_time);
+    const maxArrivalHM = toGameHM(data.latest_arrival_time);
+
+    el.innerHTML = `Takeoff: ${toGameHM(data.takeoff_time)} TCT (${data.travel_method}) <br>
+      ETA: ${minDuration} - ${maxDuration}<br>
+      <span style="font-size:90%">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${minArrivalHM} TCT - ${maxArrivalHM} TCT</span>`;
+
+    
+  // Timer to update the ETA every second
+  if (window.ffscouter_eta_interval) {
+    clearInterval(window.ffscouter_eta_interval);
+  }
+
+  function updateETA() {
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const minDuration = durationStr(nowUnix, data.earliest_arrival_time);
+    const maxDuration = durationStr(nowUnix, data.latest_arrival_time);
+
+    const minArrivalHM = toGameHM(data.earliest_arrival_time);
+    const maxArrivalHM = toGameHM(data.latest_arrival_time);
+
+    el.innerHTML = `Takeoff: ${toGameHM(data.takeoff_time)} TCT (${data.travel_method}) <br>
+      ETA: ${minDuration} - ${maxDuration}<br>
+      <span style="font-size:90%">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${minArrivalHM} TCT - ${maxArrivalHM} TCT</span>`;
+  }
+
+  // Update the ETA immediately
+  updateETA();
+
+  // Then every second
+  window.ffscouter_eta_interval = setInterval(() => {
+    // If the player is not on the screen, clear the interval; it may not exist anymore.
+    if (!document.body.contains(el)) {
+      clearInterval(window.ffscouter_eta_interval);
+      return;
+    }
+    updateETA();
+  }, 1000);
+
+  }
+
+  function fetchAndRenderCurrentFlightWhenTraveling(target_id) {
+    function onMainDescLoaded(callback) {
+      const maybeElem = document.querySelector('.main-desc');
+      if (maybeElem) {
+        callback();
+        return;
+      }
+      const observer = new MutationObserver(() => {
+        const elem = document.querySelector('.main-desc');
+        if (elem) {
+          callback();
+          observer.disconnect();
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    onMainDescLoaded(() => {
+      const text = document.querySelector('.profile-container .description .desc-wrap .main-desc')?.textContent ?? "";
+      const travelingIndicator = text.includes('Traveling') || text.includes('Returning');
+
+      if (travelingIndicator) {
+        fetchPlayerCurrentFlight(target_id).then(flightData => {
+          updatePlayerCurrentFlight(flightData);
+        });
+      }
+    });
+  }
+
 }
