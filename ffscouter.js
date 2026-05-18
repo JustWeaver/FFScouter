@@ -25,11 +25,19 @@ const CLEARED_TSC_KEY = "ffscouterv2-cleared-tsc-keys";
 const CHECK_KEY_CACHE_KEY = "ffscouterv2-check-key-cache";
 const CHECK_KEY_INTERVAL = 5 * 60 * 1000;
 const PREMIUM_UPGRADE_URL = "https://ffscouter.com/premium";
+const PROFILE_FLIGHT_CACHE_TTL_MS = 60 * 1000;
+const PROFILE_FLIGHT_RECHECK_INTERVAL_MS = 15 * 1000;
+const PROFILE_FLIGHT_RECHECK_WINDOW_MS = 3 * 60 * 1000;
+const PROFILE_FLIGHT_NO_DATA_CACHE_MS = 10 * 60 * 1000;
 const memberCountdowns = {};
 const MAX_REQUESTS_PER_MINUTE = 20;
 let apiCallInProgressCount = 0;
 let currentUserId = null;
 let premiumStatusRefreshInFlight = false;
+let profileFlightInfoLine = null;
+let profileFlightTickInterval = null;
+const profileFlightCache = new Map();
+const profileFlightRequestsInFlight = new Set();
 
 const TOAST_ERROR = "error";
 const TOAST_LOG = "log";
@@ -146,6 +154,27 @@ if (!singleton) {
                 min-width: 0;
                 flex: 0 1 auto;
                 vertical-align: bottom;
+            }
+
+            #ff-scouter-profile-flight-info {
+                position: absolute;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                z-index: 2;
+                margin: 0;
+                padding: 2px 4px 4px;
+                box-sizing: border-box;
+                text-align: center;
+                font-size: 11px;
+                line-height: 1.25;
+                color: #fff;
+                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+                pointer-events: none;
+            }
+
+            #ff-scouter-profile-flight-info a {
+                pointer-events: auto;
             }
 
             /* FF Scouter CSS Variables */
@@ -1128,6 +1157,480 @@ if (!singleton) {
     }
   }
 
+  function format_duration_human(totalSeconds) {
+    const clampedSeconds = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(clampedSeconds / 3600);
+    const minutes = Math.floor((clampedSeconds % 3600) / 60);
+    const seconds = clampedSeconds % 60;
+    const parts = [];
+    if (hours > 0) {
+      parts.push(`${hours}h`);
+    }
+    if (hours > 0 || minutes > 0) {
+      parts.push(`${minutes}m`);
+    }
+    parts.push(`${seconds}s`);
+    return parts.join(" ");
+  }
+
+  function format_tct_time(unixSeconds) {
+    if (!Number.isFinite(unixSeconds)) return null;
+    const d = new Date(unixSeconds * 1000);
+    const hours = String(d.getUTCHours()).padStart(2, "0");
+    const minutes = String(d.getUTCMinutes()).padStart(2, "0");
+    return `${hours}:${minutes}`;
+  }
+
+  function normalize_travel_description(value) {
+    if (typeof value !== "string") return "";
+    return value.replace(/\s+/g, " ").trim();
+  }
+
+  // Secondary validation: route text from `.profile-status` must look like a real
+  // Torn travel leg (e.g. "Torn to Japan") with known origin/destination names.
+  const KNOWN_TRAVEL_LOCATIONS = new Set([
+    "torn",
+    "argentina",
+    "canada",
+    "cayman islands",
+    "china",
+    "hawaii",
+    "japan",
+    "mexico",
+    "south africa",
+    "switzerland",
+    "uae",
+    "united arab emirates",
+    "uk",
+    "united kingdom",
+  ]);
+
+  function normalize_travel_location(value) {
+    return normalize_travel_description(value)
+      .toLowerCase()
+      .replace(/[^\w\s]/g, "");
+  }
+
+  function is_known_travel_location(value) {
+    return KNOWN_TRAVEL_LOCATIONS.has(normalize_travel_location(value));
+  }
+
+  function parse_profile_travel_route(statusDescription) {
+    const normalized = normalize_travel_description(statusDescription);
+    const match = normalized.match(
+      /^(?<origin>[A-Za-z][A-Za-z '&-]*)\s+to\s+(?<destination>[A-Za-z][A-Za-z '&-]*)$/,
+    );
+    if (!match) {
+      return null;
+    }
+
+    const origin = normalize_travel_description(match.groups.origin || "");
+    const destination = normalize_travel_description(
+      match.groups.destination || "",
+    );
+    if (!origin || !destination) {
+      return null;
+    }
+    if (
+      !is_known_travel_location(origin) ||
+      !is_known_travel_location(destination)
+    ) {
+      return null;
+    }
+
+    return { origin, destination };
+  }
+
+  // Read route text from `.profile-status` without our own landing line (which
+  // would break route parsing and cause the line to flicker every second).
+  function get_profile_status_travel_text(profileStatusEl) {
+    if (!profileStatusEl || !profileStatusEl.isConnected) {
+      return "";
+    }
+    const clone = profileStatusEl.cloneNode(true);
+    clone
+      .querySelectorAll("#ff-scouter-profile-flight-info")
+      .forEach((element) => element.remove());
+    return normalize_travel_description(clone.textContent || "");
+  }
+
+  function query_profile_status_element() {
+    const profileWrapper = document.querySelector(".profile-wrapper");
+    if (!profileWrapper) {
+      return null;
+    }
+    return (
+      profileWrapper.querySelector(".profile-status") ||
+      profileWrapper.querySelector('[class*="profile-status"]')
+    );
+  }
+
+  function is_profile_status_container(element) {
+    if (!element?.classList) {
+      return false;
+    }
+    return Array.from(element.classList).some((className) =>
+      className.startsWith("profile-status"),
+    );
+  }
+
+  function find_profile_route_label_element(profileStatus) {
+    return Array.from(profileStatus.querySelectorAll("span, div, p, a"))
+      .filter((element) => {
+        if (!element?.isConnected) return false;
+        if (element.id === "ff-scouter-profile-flight-info") return false;
+        if (is_profile_status_container(element)) return false;
+        const text = normalize_travel_description(element.textContent || "");
+        return (
+          text.length > 0 &&
+          text.length < 64 &&
+          parse_profile_travel_route(text) !== null
+        );
+      })
+      .sort(
+        (a, b) =>
+          normalize_travel_description(a.textContent || "").length -
+          normalize_travel_description(b.textContent || "").length,
+      )[0];
+  }
+
+  // Banner wrapper around the jet image + route label; landing overlays its bottom.
+  function find_profile_flight_info_host(profileStatus) {
+    const routeLabel = find_profile_route_label_element(profileStatus);
+    if (routeLabel?.parentElement && profileStatus.contains(routeLabel.parentElement)) {
+      let host = routeLabel.parentElement;
+      // Step up to the visual banner container (child of profile-status).
+      if (
+        host.parentElement &&
+        host.parentElement !== profileStatus &&
+        profileStatus.contains(host.parentElement)
+      ) {
+        host = host.parentElement;
+      }
+      return host;
+    }
+
+    const travelChip =
+      profileStatus.querySelector(".travel-status") ||
+      profileStatus.querySelector('[class*="travel-status"]');
+    if (
+      travelChip?.parentElement &&
+      profileStatus.contains(travelChip.parentElement)
+    ) {
+      return travelChip.parentElement;
+    }
+
+    return profileStatus;
+  }
+
+  function prepare_profile_flight_info_host(host) {
+    if (!host?.style) return;
+    if (window.getComputedStyle(host).position === "static") {
+      host.style.position = "relative";
+    }
+  }
+
+  function get_profile_travel_status_element() {
+    // Strict scope: only Torn's status box may trigger flight checks. If Torn
+    // renames this node, detection fails closed (no false positives elsewhere).
+    const profileStatus = query_profile_status_element();
+    if (!profileStatus || !profileStatus.isConnected) {
+      return null;
+    }
+
+    const statusDescription = get_profile_status_travel_text(profileStatus);
+    if (
+      !statusDescription ||
+      statusDescription.length >= 64 ||
+      parse_profile_travel_route(statusDescription) === null
+    ) {
+      return null;
+    }
+
+    return {
+      host: find_profile_flight_info_host(profileStatus),
+      profileStatus,
+      status_description: statusDescription,
+    };
+  }
+
+  function ensure_profile_flight_info_line(flightHost, statusDescription) {
+    if (!flightHost || !flightHost.isConnected) return null;
+    const hostKey = normalize_travel_description(statusDescription || "");
+
+    let line =
+      profileFlightInfoLine ||
+      document.getElementById("ff-scouter-profile-flight-info");
+    if (line && line.isConnected && flightHost.contains(line)) {
+      profileFlightInfoLine = line;
+      line.dataset.hostKey = hostKey;
+      return line;
+    }
+
+    if (line) {
+      line.remove();
+    }
+
+    prepare_profile_flight_info_host(flightHost);
+    profileFlightInfoLine = document.createElement("div");
+    profileFlightInfoLine.id = "ff-scouter-profile-flight-info";
+    profileFlightInfoLine.className = "ff-scouter-profile-flight-info";
+    profileFlightInfoLine.dataset.hostKey = hostKey;
+    flightHost.insertAdjacentElement("beforeend", profileFlightInfoLine);
+    return profileFlightInfoLine;
+  }
+
+  function clear_profile_flight_info_line() {
+    if (profileFlightInfoLine) {
+      profileFlightInfoLine.remove();
+      profileFlightInfoLine = null;
+    }
+  }
+
+  function build_landing_window_html(earliest, latest) {
+    const nowUnix = Date.now() / 1000;
+    const earliestRemaining = Math.max(0, earliest - nowUnix);
+    const latestRemaining = Math.max(0, latest - nowUnix);
+    const earliestTct = format_tct_time(earliest);
+    const latestTct = format_tct_time(latest);
+
+    if (latestRemaining <= 0) {
+      return `Landing: just landed<br>(${latestTct} TCT latest)`;
+    }
+    if (earliestRemaining <= 0) {
+      return `Landing: imminent - ${format_duration_human(latestRemaining)}<br>(Latest: ${latestTct} TCT)`;
+    }
+    return `Landing: ${format_duration_human(earliestRemaining)} - ${format_duration_human(latestRemaining)}<br>(${earliestTct} - ${latestTct} TCT)`;
+  }
+
+  function fetch_profile_flight_window(target_id, cacheKey) {
+    if (!key || !target_id) return;
+    if (profileFlightRequestsInFlight.has(cacheKey)) return;
+
+    profileFlightRequestsInFlight.add(cacheKey);
+
+    rD_xmlhttpRequest({
+      method: "GET",
+      url: `${BASE_URL}/api/v1/player-flights?key=${key}&target=${target_id}`,
+      onload: function (response) {
+        const finishRequest = () => {
+          profileFlightRequestsInFlight.delete(cacheKey);
+        };
+
+        if (!response || response.status !== 200) {
+          ffdebug(
+            "[FF Scouter V2] player-flights request failed",
+            response?.status,
+            response?.responseText,
+          );
+          try {
+            const err = JSON.parse(response?.responseText || "{}");
+            if (err?.code === 19) {
+              // Match behavior of non-premium users by showing the upgrade message.
+              profileFlightCache.set(cacheKey, {
+                fetched_at: Date.now(),
+                type: "premium_required",
+              });
+              finishRequest();
+              return;
+            }
+          } catch {
+            // Ignore parse errors and fall back to generic no-match handling.
+          }
+          profileFlightCache.set(cacheKey, {
+            fetched_at: Date.now(),
+            type: "no_match",
+          });
+          finishRequest();
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(response.responseText);
+          const current = parsed?.current;
+          const now = Date.now();
+
+          if (!current) {
+            const previous = profileFlightCache.get(cacheKey);
+            const startedAt =
+              previous?.type === "rechecking" && previous.started_at
+                ? previous.started_at
+                : now;
+            const recheckUntil = startedAt + PROFILE_FLIGHT_RECHECK_WINDOW_MS;
+
+            if (now >= recheckUntil) {
+              profileFlightCache.set(cacheKey, {
+                fetched_at: now,
+                expires_at: now + PROFILE_FLIGHT_NO_DATA_CACHE_MS,
+                type: "no_data_final",
+              });
+            } else {
+              profileFlightCache.set(cacheKey, {
+                fetched_at: now,
+                started_at: startedAt,
+                next_retry_at: now + PROFILE_FLIGHT_RECHECK_INTERVAL_MS,
+                recheck_until: recheckUntil,
+                type: "rechecking",
+              });
+            }
+            finishRequest();
+            return;
+          }
+
+          const earliest = Number(current?.earliest_arrival_time);
+          const latest = Number(current?.latest_arrival_time);
+          if (!Number.isFinite(earliest) || !Number.isFinite(latest)) {
+            profileFlightCache.set(cacheKey, {
+              fetched_at: Date.now(),
+              type: "no_match",
+            });
+            finishRequest();
+            return;
+          }
+
+          profileFlightCache.set(cacheKey, {
+            fetched_at: Date.now(),
+            type: "window",
+            earliest: earliest,
+            latest: latest,
+          });
+          finishRequest();
+        } catch (e) {
+          ffdebug("[FF Scouter V2] player-flights parse error", e);
+          profileFlightCache.set(cacheKey, {
+            fetched_at: Date.now(),
+            type: "no_match",
+          });
+          finishRequest();
+        }
+      },
+      onerror: function (e) {
+        ffdebug("[FF Scouter V2] player-flights network error", e);
+        profileFlightRequestsInFlight.delete(cacheKey);
+      },
+      onabort: function (e) {
+        ffdebug("[FF Scouter V2] player-flights aborted", e);
+        profileFlightRequestsInFlight.delete(cacheKey);
+      },
+      ontimeout: function (e) {
+        ffdebug("[FF Scouter V2] player-flights timeout", e);
+        profileFlightRequestsInFlight.delete(cacheKey);
+      },
+    });
+  }
+
+  function refresh_profile_flight_tracking(target_id) {
+    if (!target_id || !window.location.pathname.startsWith("/profiles.php")) {
+      clear_profile_flight_info_line();
+      return;
+    }
+
+    const travelStatus = get_profile_travel_status_element();
+    if (!travelStatus || !travelStatus.status_description.includes(" to ")) {
+      clear_profile_flight_info_line();
+      return;
+    }
+
+    const line = ensure_profile_flight_info_line(
+      travelStatus.host,
+      travelStatus.status_description,
+    );
+    if (!line) return;
+
+    const isPremium = getCachedPremiumStatus();
+    if (isPremium === false) {
+      line.innerHTML = `<a href="${PREMIUM_UPGRADE_URL}" target="_blank" rel="noopener noreferrer" style="font-weight: bold; text-decoration: underline;">Upgrade to FFScouter Flight Tracking</a>`;
+      return;
+    }
+
+    // Only premium users may fetch flight tracking data.
+    if (isPremium !== true) {
+      line.textContent = "";
+      return;
+    }
+
+    const cacheKey = `${travelStatus.status_description}|${target_id}`;
+    const cached = profileFlightCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached?.type === "premium_required") {
+      line.innerHTML = `<a href="${PREMIUM_UPGRADE_URL}" target="_blank" rel="noopener noreferrer" style="font-weight: bold; text-decoration: underline;">Upgrade to FFScouter Flight Tracking</a>`;
+      return;
+    }
+
+    if (cached?.type === "rechecking") {
+      if (now >= cached.recheck_until) {
+        profileFlightCache.set(cacheKey, {
+          fetched_at: now,
+          expires_at: now + PROFILE_FLIGHT_NO_DATA_CACHE_MS,
+          type: "no_data_final",
+        });
+        line.textContent = "No flight data available";
+        return;
+      }
+
+      const secondsToRetry = Math.max(
+        0,
+        Math.ceil((cached.next_retry_at - now) / 1000),
+      );
+      line.textContent = `No data. Rechecking in ${secondsToRetry} seconds.`;
+
+      if (now >= cached.next_retry_at) {
+        fetch_profile_flight_window(
+          target_id,
+          cacheKey,
+        );
+      }
+      return;
+    }
+
+    if (
+      cached?.type === "no_data_final" &&
+      cached.expires_at &&
+      now < cached.expires_at
+    ) {
+      line.textContent = "No flight data available";
+      return;
+    }
+
+    const isFresh =
+      cached &&
+      (cached.expires_at
+        ? now < cached.expires_at
+        : now - cached.fetched_at < PROFILE_FLIGHT_CACHE_TTL_MS);
+
+    if (!isFresh) {
+      fetch_profile_flight_window(
+        target_id,
+        cacheKey,
+      );
+      if (!cached) {
+        line.textContent = "Landing: estimating...";
+      }
+      return;
+    }
+
+    if (cached.type === "window") {
+      line.innerHTML = build_landing_window_html(cached.earliest, cached.latest);
+      return;
+    }
+
+    // Keep a stable visible message rather than disappearing after "loading".
+    line.textContent = "Landing: unavailable for current route";
+  }
+
+  function init_profile_flight_tracking(target_id) {
+    if (profileFlightTickInterval) {
+      clearInterval(profileFlightTickInterval);
+      profileFlightTickInterval = null;
+    }
+    refresh_profile_flight_tracking(target_id);
+    profileFlightTickInterval = setInterval(
+      () => refresh_profile_flight_tracking(target_id),
+      1000,
+    );
+  }
+
   function get_ff_string(ff_response) {
     const ff = ff_response.value.toFixed(2);
 
@@ -1736,6 +2239,7 @@ if (!singleton) {
     update_ff_cache([target_id], function (target_ids) {
       display_fair_fight(target_ids[0], target_id);
     });
+    init_profile_flight_tracking(target_id);
 
     // Inject Stats History button into Actions area
     // Use a MutationObserver in case the Actions area loads after page JS runs
@@ -1760,6 +2264,7 @@ if (!singleton) {
   } else if (
     window.location.href.startsWith("https://www.torn.com/factions.php")
   ) {
+    clear_profile_flight_info_line();
     const torn_observer = new MutationObserver(async function () {
       // Find the member table - add a column if it doesn't already have one, for FF scores
       var members_list = document.querySelector(".members-list");
@@ -1782,7 +2287,11 @@ if (!singleton) {
       set_message("[FF Scouter V2]: Limited API key needed - click to add");
     }
   } else {
-    // console.log("Did not match against " + window.location.href);
+    clear_profile_flight_info_line();
+    if (profileFlightTickInterval) {
+      clearInterval(profileFlightTickInterval);
+      profileFlightTickInterval = null;
+    }
   }
 
   function get_player_id_in_element(element) {
